@@ -1,0 +1,28 @@
+# Project metadata and tool configuration. There is deliberately no [build-system] table: nothing
+# here is installable or buildable. [project].version is the release version, which ease reads to
+# tag and title each release. The tool tables let bare `ruff` and `pyright` pick up the right
+# settings. Python never reads this file at runtime, so `python ease.py` keeps working without it.
+
+[project]
+name = "ease"
+version = "0.1.0"
+description = "Publish release snapshots of a development branch onto a release branch."
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+# .claude/hooks holds generated dispatcher scripts that this project does not own.
+extend-exclude = [".claude"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ANN", "D"]
+# D203 and D213 contradict D211 and D212, which the google convention selects.
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
+exclude = [".claude"]
