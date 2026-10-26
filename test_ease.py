@@ -11,6 +11,7 @@ import contextlib
 import datetime
 import io
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -163,6 +164,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_rejects_invalid_config(self) -> None:
         """Unknown keys, wrong types, and inconsistent values are errors."""
+        hook = '\n[hooks]\npre-release = "x"'
         cases = {
             "unknown key": 'colour = "red"',
             "unknown hook": '[hooks]\npre-commit = "x"',
@@ -171,6 +173,9 @@ class ConfigTest(unittest.TestCase):
             "wrong type": "tag = 1",
             "same branches": 'dev-branch = "main"',
             "bad toml": "tag = ",
+            "artifacts without a pre-release hook": 'artifacts = "build"',
+            "artifacts outside the repository": 'artifacts = "../build"' + hook,
+            "absolute artifacts": 'artifacts = "/tmp/build"' + hook,
         }
         for label, text in cases.items():
             with self.subTest(label), self.assertRaises(ease.EaseError):
@@ -619,6 +624,87 @@ class ReleaseTest(RepoTestCase):
     def git_ok(self, *args: str) -> bool:
         """Report whether a git command succeeds in the project."""
         return subprocess.run(["git", *args], cwd=self.repo, check=False).returncode == 0
+
+
+class ArtifactsTest(RepoTestCase):
+    """`artifacts` adds the pre-release hook's build outputs to the release."""
+
+    artifact = "docs/guide.txt"
+
+    def setUp(self) -> None:
+        """Build the fixture."""
+        super().setUp()
+        self.prepared()
+
+    def set_artifacts(self, hook: str, required: str = "") -> None:
+        """Set the artifacts directory, the hook that fills it, and any required paths."""
+        config = (self.repo / ease.CONFIG_FILE).read_text()
+        config = config.replace('# artifacts = "build/release"', 'artifacts = "build/release"')
+        config = config.replace("[hooks]\n", f"[hooks]\npre-release = {hook!r}\n")
+        if required:
+            config, count = re.subn(
+                r"^required = \[", f'required = ["{required}", ', config, flags=re.M
+            )
+            self.assertEqual(count, 1, "no required list in the config")
+        self.write(ease.CONFIG_FILE, config)
+        self.write(".gitignore", "build/\n")
+        self.commit("Build artifacts.")
+
+    def build(self, path: str = artifact) -> str:
+        """Return a hook command that writes one artifact."""
+        target = f"build/release/{path}"
+        return f"rm -rf build/release && mkdir -p {Path(target).parent} && echo built > {target}"
+
+    def test_adds_the_artifacts_at_their_paths(self) -> None:
+        """An artifact joins the release under its path, and can be required."""
+        self.set_artifacts(self.build(), required=self.artifact)
+        self.ease_ok("release", "-y", "--offline")
+        self.assertEqual(self.git("show", f"main:{self.artifact}"), "built")
+        self.assertFalse(self.git_ok_quiet("cat-file", "-e", f"dev:{self.artifact}"))
+
+    def test_refuses_unusable_artifacts(self) -> None:
+        """Missing, empty, stale, or overlapping artifacts never reach a release."""
+        stale = self.repo / "build/release/old.txt"
+        cases = {
+            "no directory": ("true", "no artifacts directory"),
+            "empty directory": ("mkdir -p build/release", "is empty"),
+            "stale file": ("touch build/release", "predates"),
+            "overlapping file": (self.build("README.md"), "would replace"),
+        }
+        base = self.git("rev-parse", "HEAD")
+        for label, (hook, message) in cases.items():
+            with self.subTest(label):
+                self.git("reset", "--quiet", "--hard", base)
+                subprocess.run(["rm", "-rf", str(self.repo / "build")], check=True)
+                if label == "stale file":
+                    stale.parent.mkdir(parents=True)
+                    stale.write_text("old\n")
+                    os.utime(stale, (0, 0))
+                self.set_artifacts(hook)
+                main_before = self.git("rev-parse", "main")
+                code, _, err = self.ease("release", "-y", "--offline")
+                self.assertEqual(code, 1, err)
+                self.assertIn(message, err)
+                self.assertEqual(self.git("rev-parse", "main"), main_before)
+
+    def test_status_expects_required_artifacts_from_the_hook(self) -> None:
+        """Without a release, status cannot see the artifacts: a warning, not an error."""
+        self.set_artifacts(self.build(), required=self.artifact)
+        code, out, _ = self.ease("status", "--offline")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"must build them into 'build/release': {self.artifact}", out)
+
+    def test_refuses_to_skip_the_hook_that_builds_the_artifacts(self) -> None:
+        """Without the hook, the artifacts may not match the source."""
+        self.set_artifacts(self.build())
+        code, _, err = self.ease("release", "-y", "--offline", "--skip-hooks")
+        self.assertEqual(code, 1)
+        self.assertIn("only the pre-release hook builds", err)
+
+    def git_ok_quiet(self, *args: str) -> bool:
+        """Report whether a git command succeeds in the project, without output."""
+        result = subprocess.run(["git", *args], cwd=self.repo, capture_output=True, check=False)
+        return result.returncode == 0
 
 
 class EditMessageTest(RepoTestCase):

@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -117,6 +118,7 @@ class Config:
     subject: str = "Release {version}."
     changelog_commit: str = "Update the changelog for {version}."
     required: tuple[str, ...] = ()
+    artifacts: str = ""
     version_source: str = "changelog"
     version_path: str = ""
     version_command: str = ""
@@ -135,6 +137,7 @@ TOP_LEVEL_KEYS = {
     "subject": "subject",
     "changelog-commit": "changelog_commit",
     "required": "required",
+    "artifacts": "artifacts",
 }
 LIST_KEYS = ("release-remotes", "required")
 VERSION_KEYS = {"source": "version_source", "path": "version_path", "command": "version_command"}
@@ -201,6 +204,12 @@ def config_from_toml(text: str) -> Config:
         raise EaseError(f"{CONFIG_FILE}: the branch names must not be empty")
     if config.dev_branch == config.release_branch:
         raise EaseError(f"{CONFIG_FILE}: dev-branch and release-branch must differ")
+    if config.artifacts:
+        parts = Path(config.artifacts).parts
+        if Path(config.artifacts).is_absolute() or ".." in parts or not parts:
+            raise EaseError(f"{CONFIG_FILE}: 'artifacts' must be a directory inside the repository")
+        if not config.hooks.get("pre-release"):
+            raise EaseError(f"{CONFIG_FILE}: 'artifacts' needs a pre-release hook to build them")
     return config
 
 
@@ -242,6 +251,9 @@ subject = "Release {{version}}."
 changelog-commit = "Update the changelog for {{version}}."
 # Paths a release snapshot must never drop.
 required = {q_list(required)}
+# A directory the pre-release hook fills with build outputs to add to each release, laid out
+# as in the snapshot: <artifacts>/docs/guide.pdf becomes docs/guide.pdf.
+# artifacts = "build/release"
 
 [version]
 # One of: {", ".join(VERSION_SOURCES)}.
@@ -722,15 +734,57 @@ def to_pathspec(pattern: str) -> str:
 
 @dataclass(frozen=True)
 class Snapshot:
-    """A release tree, and what building it dropped."""
+    """A release tree, what building it dropped, and the build outputs it added."""
 
     tree: str
     dropped: list[str]
     counts: list[tuple[str, int]]
+    added: list[str] = field(default_factory=list[str])
+    missing: list[str] = field(default_factory=list[str])
+    """Required paths absent from a snapshot built with `strict=False`."""
 
 
-def build_snapshot(git: Git, source: str, config: Config) -> Snapshot:
-    """Build the tree of `source` minus the `.mergeignore` paths, in a temporary index."""
+def collect_artifacts(root: Path, directory: str, since: float) -> list[tuple[str, Path]]:
+    """List the files under the artifacts directory, as (snapshot path, file) pairs.
+
+    Every file must be newer than `since`, the start of the pre-release hook: an older one is a
+    leftover of an earlier build, which may not match the source being released.
+    """
+    base = root / directory
+    if not base.is_dir():
+        raise EaseError(f"the pre-release hook left no artifacts directory '{directory}'")
+    artifacts: list[tuple[str, Path]] = []
+    for path in sorted(base.rglob("*")):
+        if path.is_symlink():
+            raise EaseError(f"artifact '{path.relative_to(root)}' is a symbolic link")
+        if not path.is_file():
+            continue
+        # One second of slack for file systems with coarse timestamps.
+        if path.stat().st_mtime < since - 1:
+            raise EaseError(
+                f"artifact '{path.relative_to(root)}' predates the pre-release hook: "
+                "make the hook rebuild the whole directory"
+            )
+        artifacts.append((path.relative_to(base).as_posix(), path))
+    if not artifacts:
+        raise EaseError(f"the artifacts directory '{directory}' is empty")
+    return artifacts
+
+
+def build_snapshot(
+    git: Git,
+    source: str,
+    config: Config,
+    artifacts: Sequence[tuple[str, Path]] = (),
+    *,
+    strict: bool = True,
+) -> Snapshot:
+    """Build the tree of `source` minus the `.mergeignore` paths, in a temporary index.
+
+    The `artifacts`, from `collect_artifacts`, join the tree at their paths; none may replace a
+    file of the source. A missing required path is an error, unless `strict` is off: `status`
+    builds snapshots without the artifacts, which only a release builds.
+    """
     text = git.show(source, config.mergeignore)
     if text is None:
         raise EaseError(f"'{config.mergeignore}' not found at {source}: commit it there first")
@@ -752,14 +806,25 @@ def build_snapshot(git: Git, source: str, config: Config) -> Snapshot:
                 "update-index", "--force-remove", "-z", "--stdin",
                 input="".join(f"{p}\0" for p in dropped), env=env,
             )  # fmt: skip
-        for path in config.required:
-            if not git.ok("ls-files", "--error-unmatch", "--", path, env=env):
-                raise EaseError(
-                    f"the snapshot lacks '{path}', which a release cannot omit: "
-                    f"check {config.mergeignore} and the source"
-                )
+        for path, file in artifacts:
+            if ls(f":(literal){path}"):
+                raise EaseError(f"artifact '{path}' would replace a file of the snapshot")
+            blob = git.run("hash-object", "-w", "--", str(file))
+            mode = "100755" if os.access(file, os.X_OK) else "100644"
+            git.run("update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}", env=env)
+        missing = [
+            path
+            for path in config.required
+            if not git.ok("ls-files", "--error-unmatch", "--", path, env=env)
+        ]
+        if missing and strict:
+            raise EaseError(
+                f"the snapshot lacks '{missing[0]}', which a release cannot omit: "
+                f"check {config.mergeignore} and the source"
+            )
         tree = git.run("write-tree", env=env)
-    return Snapshot(tree=tree, dropped=dropped, counts=counts)
+    added = [path for path, _ in artifacts]
+    return Snapshot(tree=tree, dropped=dropped, counts=counts, added=added, missing=missing)
 
 
 # ── init ─────────────────────────────────────────────────────────────────────
@@ -1162,16 +1227,27 @@ def cmd_release(args: argparse.Namespace, git: Git, config: Config) -> int:
         )
 
         # ── Gate ──
+        hook_start: float | None = None
         if "pre-release" in config.hooks:
             if args.skip_hooks:
                 warn("skipping the pre-release hook (--skip-hooks)")
             elif not worktree_at_source:
                 warn(f"skipping the pre-release hook: the working tree is not at {source_ref}")
-            elif not run_hook("pre-release", config, git.root, env):
-                raise EaseError("the pre-release hook failed")
+            else:
+                hook_start = time.time()
+                if not run_hook("pre-release", config, git.root, env):
+                    raise EaseError("the pre-release hook failed")
 
         # ── Snapshot and review ──
-        snapshot = build_snapshot(git, snapshot_source, config)
+        artifacts: list[tuple[str, Path]] = []
+        if config.artifacts:
+            if hook_start is None:
+                raise EaseError(
+                    "the release adds artifacts, which only the pre-release hook builds: "
+                    f"run it without --skip-hooks, with the working tree at {source_ref}"
+                )
+            artifacts = collect_artifacts(git.root, config.artifacts, hook_start)
+        snapshot = build_snapshot(git, snapshot_source, config, artifacts)
         print()
         info(f"=== {config.mergeignore} (at {source_ref}) ===")
         for pattern, count in snapshot.counts:
@@ -1210,6 +1286,11 @@ def cmd_release(args: argparse.Namespace, git: Git, config: Config) -> int:
         for path in snapshot.dropped:
             print(f"  {path}")
         print()
+        if config.artifacts:
+            info(f"=== added from {config.artifacts} ({len(snapshot.added)}) ===")
+            for path in snapshot.added:
+                print(f"  {path}")
+            print()
         info(f"=== {branch} ({git.short(parent)}) to the snapshot ===")
         print(git.run("diff", "--stat", parent, snapshot.tree))
         print()
@@ -1628,6 +1709,8 @@ def collect_checks(git: Git, config: Config, config_error: str | None, offline: 
     released = tag is not None and git.rev(f"refs/tags/{tag}") is not None
     if version:
         report.ok(f"version at '{dev}': {version}" + (f" (tag {tag} exists)" if released else ""))
+    if config.artifacts:
+        report.ok(f"releases add the build outputs in '{config.artifacts}' (pre-release hook)")
 
     changelog = git.show(dev_sha, config.changelog) if config.changelog else None
     if (
@@ -1639,10 +1722,15 @@ def collect_checks(git: Git, config: Config, config_error: str | None, offline: 
     if release_sha is None or git.show(dev_sha, config.mergeignore) is None:
         return report
     try:
-        snapshot = build_snapshot(git, dev_sha, config)
+        snapshot = build_snapshot(git, dev_sha, config, strict=not config.artifacts)
     except EaseError as exc:
         report.error(f"snapshot: {exc}")
         return report
+    if snapshot.missing:
+        report.warn(
+            f"required path(s) not in '{dev}', so the pre-release hook must build them into "
+            f"'{config.artifacts}': {', '.join(snapshot.missing)}"
+        )
     changed = git.run("diff", "--name-only", release_sha, snapshot.tree).splitlines()
     if not changed:
         report.ok(f"'{branch}' matches the snapshot of '{dev}': nothing to release")

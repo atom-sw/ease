@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-26
+
+### Added
+
+- `artifacts` adds the build outputs of the `pre-release` hook, such as a rendered manual, to
+  each release, without tracking them on the development branch.
+
 ## [0.1.0] - 2026-10-26
 
 First release of `ease` as a standalone project, moved out of another private repository.

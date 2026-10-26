@@ -146,6 +146,7 @@ tag = "v{version}"               # "" disables tagging
 subject = "Release {version}."   # {version} and {date}; "" opens the editor
 changelog-commit = "Update the changelog for {version}."
 required = []                    # paths a snapshot must keep
+artifacts = ""                   # build outputs to add, e.g. "build/release"
 
 [version]
 source = "changelog"
@@ -166,6 +167,34 @@ Each line is a `git` pathspec with globs, which behaves like `.gitignore`: `*` s
 `**` crosses it, and a directory name drops its whole subtree. For example, a top-level `TODO.md` drops only
 `TODO.md`, and leaves `docs/TODO.md` alone. A line starting with `:` goes to git verbatim, for
 other pathspec magic. Blank lines and `#` comments are ignored.
+
+### Release artifacts
+
+Some outputs belong in a release but not in the development history: a rendered manual, a
+generated reference. Set `artifacts` to a directory, and make the `pre-release` hook build into
+it. The directory mirrors the snapshot: `build/release/docs/manual.pdf` becomes `docs/manual.pdf`
+in the release commit, while `dev` never tracks it.
+
+```toml
+artifacts = "build/release"
+required = ["docs/manual.pdf"]   # required paths may name artifacts
+
+[hooks]
+pre-release = "make check && rm -rf build/release && make manual OUT=build/release/docs"
+```
+
+`release` refuses, and writes nothing, when:
+
+- the pre-release hook did not run (`--skip-hooks`, or the working tree is not at the source),
+  since the artifacts could then come from another tree;
+- the directory is missing or empty, or holds a symbolic link;
+- a file is older than the hook's start, a leftover of an earlier build: let the hook rebuild
+  the whole directory, as `ease` never deletes it;
+- an artifact would replace a file of the snapshot.
+
+The review lists the added artifacts, `--dry-run` included. `status` cannot see them, as only a
+release runs the hook: it warns about required paths missing from `dev` instead of failing. An
+`artifacts` setting needs a `pre-release` hook.
 
 ### Version sources
 
