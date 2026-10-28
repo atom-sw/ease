@@ -15,6 +15,9 @@ ease status                                                # anytime
 ease release --changelog --push                            # each release
 ```
 
+To vet each release before it goes public, such as with CI in a private repository, stage it
+first: see [Staging releases](#-staging-releases).
+
 ## 📦 Install
 
 Copy `ease.py` somewhere on your `PATH` as `ease`, or run it in place:
@@ -34,7 +37,8 @@ Turns a repository with only its default branch into a dev/main setup:
 1. It creates `dev` from the current branch and checks it out.
 2. It writes `.ease.toml`, a commented `.mergeignore`, and a Keep a Changelog `CHANGELOG.md` (unless
    one exists).
-3. It adds any `--remote NAME=URL` and lists every remote under `release-remotes`.
+3. It adds any `--remote NAME=URL` and lists every remote under `release-remotes`, except those
+   named with `--staging-remote NAME`, which go under `staging-remotes`.
 4. It commits the setup on `dev`. It pushes nothing.
 
 `init` guesses the version source from the manifests it finds (`pyproject.toml`, `package.json`,
@@ -71,7 +75,8 @@ the tag queries.
 its remote, pushes a branch that is strictly ahead, pushes missing tags, recreates a missing
 branch from its remote, and writes a missing `.ease.toml`, `.mergeignore`, or changelog to the
 working tree for you to review and commit. It reports a diverged branch or a moved tag, and never
-touches it.
+touches it. With staging remotes, it never pushes to a release remote: it reports a staged release
+as not yet published, for `ease publish` to handle.
 
 ### `ease changelog [VERSION]`
 
@@ -106,7 +111,8 @@ when the snapshot would drop a path listed under `required`. It also refuses, un
 - `dev` is behind or has diverged from `dev-remote`, so the snapshot would miss commits that are
   only on the remote, such as a fix released from another machine (being ahead is fine);
 - the tag already exists, meaning the version needs a bump;
-- `--amend` would replace a release that is already on a remote;
+- `--amend` would replace a release that is already on a release remote (a staging remote does
+  not count);
 - the snapshot is identical to `main`.
 
 Useful options:
@@ -115,6 +121,7 @@ Useful options:
 |---|---|
 | `--changelog` | Promote the Unreleased section first, committing it on `dev` |
 | `--push` | Run `ease push` afterward; otherwise `release` prints the push commands |
+| `--publish` | With staging remotes, run `ease push` and then `ease publish` |
 | `--amend` | Replace the unpushed release at the tip of `main`, moving its tag |
 | `-F FILE` | Take the release notes from `FILE` instead of the changelog |
 | `-m MSG` | Use `MSG` as the whole commit message (for versionless projects) |
@@ -130,6 +137,21 @@ it is ahead (`--no-dev` skips that). Pushing the branch before the tag matters w
 triggers CI: the workflow then finds the commit on the branch. After `release --amend`, `push`
 replaces the old release with `--force-with-lease`; it refuses any other divergence.
 
+With staging remotes, `push` sends the release to them instead, and never to a release remote.
+
+### `ease publish`
+
+Only with staging remotes: pushes the staged release at the tip of `main`, and its tags, on to
+every release remote.
+
+1. It refuses unless the release is on every staging remote, tag included (`--force` overrides).
+2. It runs the `pre-publish` hook, which can veto the publication by failing.
+3. It prints the pushes and asks for confirmation (`-y` skips it; `--dry-run` stops here).
+4. It pushes, then runs the `post-publish` hook.
+
+It never overwrites a release remote, since a published release is final: `--force` allows
+replacing a release that `release --amend --force` rewrote.
+
 ## ⚙️ Configuration
 
 `ease` reads `.ease.toml` from the committed tip of the development branch, so a release never
@@ -140,6 +162,7 @@ dev-branch = "dev"
 release-branch = "main"
 dev-remote = "origin"            # "" for none
 release-remotes = ["origin"]     # e.g. ["origin", "public"]
+staging-remotes = []             # e.g. ["origin"], with release-remotes = ["public"]
 mergeignore = ".mergeignore"
 changelog = "CHANGELOG.md"       # "" to pass notes with -F or -m
 tag = "v{version}"               # "" disables tagging
@@ -157,6 +180,8 @@ source = "changelog"
 # pre-release = "..."
 # post-release = "..."
 # post-push = "..."
+# pre-publish = "..."
+# post-publish = "..."
 ```
 
 `ease` always drops `.ease.toml` and the mergeignore file from a snapshot.
@@ -226,13 +251,17 @@ Hooks are shell commands, run from the repository root:
 | `pre-release` | before the snapshot, also on `--dry-run` | aborts the release |
 | `post-release` | after the commit and tag | warns |
 | `post-push` | after `ease push` | warns |
+| `pre-publish` | before `ease publish` pushes, also on `--dry-run` | aborts the publication |
+| `post-publish` | after `ease publish` | warns |
 
 `pre-release` is the place for the project's gate, such as `mise run check` or `make test`. It
 runs only when the working tree is at the source commit, since that is the tree it inspects.
+`pre-publish` is the place to vet a staged release, such as waiting for its CI run.
 `--skip-hooks` skips all hooks.
 
 The release hooks receive these environment variables. `post-push` receives only `EASE_TAG`,
-`EASE_COMMIT`, and the branch and remote variables.
+`EASE_COMMIT`, and the branch and remote variables; the publish hooks receive those and
+`EASE_DRY_RUN`.
 
 | Variable | Value |
 |---|---|
@@ -244,6 +273,7 @@ The release hooks receive these environment variables. `post-push` receives only
 | `EASE_DRY_RUN` | `1` on `--dry-run`, else `0` |
 | `EASE_DEV_BRANCH`, `EASE_RELEASE_BRANCH` | the branch names |
 | `EASE_REMOTES` | the release remotes, space-separated |
+| `EASE_STAGING_REMOTES` | the staging remotes, space-separated |
 
 For example, a Python package published by a tag-triggered workflow:
 
@@ -261,9 +291,39 @@ post-release = 'echo "Pushing $EASE_TAG triggers the PyPI upload."'
 - **Two repositories**: `release-remotes = ["origin", "public"]` pushes `main` and its tags to
   both, while `dev` goes only to `origin`.
 - **One repository**: `release-remotes = ["origin"]` keeps both branches there.
+- **Staged**: `staging-remotes = ["origin"]` and `release-remotes = ["public"]`; see below.
 - **No versions**: `[version] source = "none"`, `tag = ""`, and `changelog = ""`; publish with
   `ease release -m "Describe the snapshot."`, or set `subject = ""` to write the message in the
   editor.
+
+## 🎭 Staging releases
+
+Publishing a release can be final: a package index may fetch it at once and never let it be
+replaced, and a tag-triggered workflow may upload it. Staging puts a step in between, where the
+release has been pushed somewhere, but can still be amended:
+
+```toml
+release-remotes = ["public"]
+staging-remotes = ["origin"]
+
+[hooks]
+pre-publish = "./scripts/wait-for-ci.sh $EASE_COMMIT"   # fail to veto the publication
+```
+
+```sh
+ease release --changelog --push      # stage: origin runs CI on the release
+ease release --amend --push          # if CI fails: fix on dev, rebuild, restage
+ease publish                         # once CI passes: on to public
+```
+
+`ease release --publish` does both phases in one go. Staging is worth it when:
+
+- CI runs only on a push, such as on a clean runner in a private repository, or a workflow
+  triggered by the tag, and you want it to pass before anything is public;
+- a registry consumes whatever reaches the release remote, and never gives a version back;
+- someone reviews the release commit before it goes out.
+
+Without any of these, skip it: `ease push` to the release remotes is one step less.
 
 ## 🧪 Development
 

@@ -176,6 +176,8 @@ class ConfigTest(unittest.TestCase):
             "artifacts without a pre-release hook": 'artifacts = "build"',
             "artifacts outside the repository": 'artifacts = "../build"' + hook,
             "absolute artifacts": 'artifacts = "/tmp/build"' + hook,
+            "a remote both staging and release": 'staging-remotes = ["origin"]',
+            "staging without release remotes": 'staging-remotes = ["a"]\nrelease-remotes = []',
         }
         for label, text in cases.items():
             with self.subTest(label), self.assertRaises(ease.EaseError):
@@ -381,6 +383,21 @@ class InitTest(RepoTestCase):
         self.assertEqual(config.version_source, "pyproject")
         self.assertEqual(config.required, ("LICENSE", "README.md"))
         self.assertEqual(self.git("remote", "get-url", "public"), str(self.remotes["public"]))
+
+    def test_staging_remote_leaves_the_release_remotes(self) -> None:
+        """A remote named with --staging-remote stages releases instead of publishing them."""
+        self.ease_ok(
+            "init", "--remote", f"public={self.remotes['public']}", "--staging-remote", "origin"
+        )
+        config = ease.config_from_toml((self.repo / ease.CONFIG_FILE).read_text())
+        self.assertEqual(config.staging_remotes, ("origin",))
+        self.assertEqual(config.release_remotes, ("public",))
+
+    def test_refuses_an_unknown_staging_remote(self) -> None:
+        """A staging remote must be a remote."""
+        code, _, err = self.ease("init", "--staging-remote", "nowhere")
+        self.assertEqual(code, 1)
+        self.assertIn("nowhere", err)
 
     def test_dry_run_changes_nothing(self) -> None:
         """No branch, no files."""
@@ -791,6 +808,122 @@ class ReleaseChangelogTest(RepoTestCase):
         self.ease_ok("changelog", "--date", date)
         self.assertIn(f"## [{self.version}] - {date}", (self.repo / "CHANGELOG.md").read_text())
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+
+class StagingTest(RepoTestCase):
+    """With staging-remotes, `push` stages a release and `publish` sends it on."""
+
+    def setUp(self) -> None:
+        """Stage on origin, publish to public, and record the publish hooks."""
+        super().setUp()
+        self.prepared()
+        self.tag = f"v{self.version}"
+        self.record = self.base / "hooks.log"
+        self.configure(
+            'release-remotes = ["origin", "public"]',
+            'release-remotes = ["public"]\nstaging-remotes = ["origin"]',
+        )
+        self.configure(
+            "[hooks]\n",
+            f'[hooks]\npre-publish = "echo pre $EASE_TAG $EASE_COMMIT >> {self.record}"\n'
+            f'post-publish = "echo post $EASE_TAG >> {self.record}"\n',
+        )
+
+    def on_remote(self, remote: str, ref: str) -> bool:
+        """Report whether a ref exists in one of the bare remotes."""
+        return self.git_in_ok(self.remotes[remote], "rev-parse", "--verify", "--quiet", ref)
+
+    def git_in_ok(self, directory: Path, *args: str) -> bool:
+        """Report whether a git command succeeds in a directory."""
+        return subprocess.run(["git", *args], cwd=directory, capture_output=True).returncode == 0
+
+    def test_push_stages_without_publishing(self) -> None:
+        """The release reaches the staging remote only."""
+        out = self.ease_ok("release", "-y", "--push")
+        main = self.git("rev-parse", "main")
+        self.assertEqual(self.remote_rev("origin", f"{self.tag}^{{commit}}"), main)
+        self.assertFalse(self.on_remote("public", "main"))
+        self.assertFalse(self.on_remote("public", self.tag))
+        self.assertIn("ease publish", out)
+
+    def test_publish_sends_the_staged_release_on(self) -> None:
+        """Branch and tag reach the release remote, between the two publish hooks."""
+        self.ease_ok("release", "-y", "--push")
+        self.ease_ok("publish", "-y")
+        main = self.git("rev-parse", "main")
+        self.assertEqual(self.remote_rev("public", "main"), main)
+        self.assertEqual(self.remote_rev("public", f"{self.tag}^{{commit}}"), main)
+        self.assertEqual(
+            self.record.read_text().splitlines(), [f"pre {self.tag} {main}", f"post {self.tag}"]
+        )
+        self.assertIn("already published", self.ease_ok("publish", "-y"))
+
+    def test_release_publish_stages_then_publishes(self) -> None:
+        """One command does both phases."""
+        self.ease_ok("release", "-y", "--publish")
+        main = self.git("rev-parse", "main")
+        for remote in self.remotes:
+            with self.subTest(remote):
+                self.assertEqual(self.remote_rev(remote, "main"), main)
+
+    def test_failing_pre_publish_hook_publishes_nothing(self) -> None:
+        """The hook vets the staged release, and can veto its publication."""
+        self.configure("pre-publish = ", 'pre-publish = "exit 3" # ')
+        self.ease_ok("release", "-y", "--push")
+        code, _, err = self.ease("publish", "-y")
+        self.assertEqual(code, 1)
+        self.assertIn("pre-publish", err)
+        self.assertFalse(self.on_remote("public", "main"))
+
+    def test_dry_run_runs_the_hook_and_publishes_nothing(self) -> None:
+        """A dry run previews the verdict without pushing."""
+        self.ease_ok("release", "-y", "--push")
+        self.ease_ok("publish", "--dry-run")
+        self.assertIn("pre ", self.record.read_text())
+        self.assertFalse(self.on_remote("public", "main"))
+
+    def test_publish_refuses_an_unstaged_release(self) -> None:
+        """Whatever vets the staged release has not seen this one."""
+        self.ease_ok("release", "-y")
+        code, _, err = self.ease("publish", "-y")
+        self.assertEqual(code, 1)
+        self.assertIn("not staged on 'origin'", err)
+        self.assertFalse(self.on_remote("public", "main"))
+
+    def test_amend_replaces_a_staged_release_without_force(self) -> None:
+        """Staging is private: a staged release can be rebuilt, twice over, and restaged."""
+        self.ease_ok("release", "-y", "--push")
+        for fix in ("First fix.", "Second fix."):
+            with self.subTest(fix):
+                self.write("README.md", f"{fix}\n")
+                self.commit(fix)
+                self.ease_ok("release", "--amend", "-y")
+        self.ease_ok("push")
+        main = self.git("rev-parse", "main")
+        self.assertEqual(self.remote_rev("origin", "main"), main)
+        self.assertEqual(self.remote_rev("origin", f"{self.tag}^{{commit}}"), main)
+
+    def test_amend_refuses_a_published_release(self) -> None:
+        """Only the release remotes make a release immutable."""
+        self.ease_ok("release", "-y", "--publish")
+        code, _, err = self.ease("release", "--amend", "-y")
+        self.assertEqual(code, 1)
+        self.assertIn("already on 'public'", err)
+
+    def test_status_reports_a_staged_release_and_fix_does_not_publish(self) -> None:
+        """--fix never pushes to a release remote: only `ease publish` does."""
+        self.ease_ok("release", "-y", "--push")
+        self.ease("status", "--fix")
+        _, out, _ = self.ease("status")
+        self.assertIn("ease publish", out)
+        self.assertFalse(self.on_remote("public", "main"))
+
+    def test_publish_needs_staging_remotes(self) -> None:
+        """Without staging, `ease push` already publishes."""
+        self.configure('staging-remotes = ["origin"]', "")
+        code, _, err = self.ease("publish", "-y")
+        self.assertEqual(code, 1)
+        self.assertIn("staging-remotes", err)
 
 
 class StatusTest(RepoTestCase):

@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-28
+
+### Added
+
+- `staging-remotes` stage a release before publishing it. `ease push` (and `release --push`) then
+  pushes the release to them only, where `release --amend` can still replace it without
+  `--force`.
+- `ease publish` pushes a staged release on to the release remotes. It refuses a release that
+  is not staged, and never overwrites a release remote unless forced.
+- `pre-publish` and `post-publish` hooks. A failing `pre-publish` hook, such as one waiting for
+  the staged CI run, vetoes the publication.
+- `ease release --publish` stages a release and publishes it in one go.
+- `ease init --staging-remote NAME` puts a remote under `staging-remotes`.
+- `ease status` reports a staged release as not yet published, and `--fix` never pushes to a
+  release remote when there are staging remotes.
+
 ## [0.2.0] - 2026-10-26
 
 ### Added

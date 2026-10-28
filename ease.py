@@ -6,8 +6,9 @@ Usage:
     ease init --remote public=git@github.com:org/project.git
     ease status [--fix]
     ease changelog 1.2.0
-    ease release [--changelog] [--push]
+    ease release [--changelog] [--push | --publish]
     ease push
+    ease publish
 
 A repository managed by ease keeps two lines of history. Work happens on the development branch
 (`dev`). Each release is a single commit on the release branch (`main`) whose parent is the
@@ -15,6 +16,8 @@ previous release commit and whose tree is the development tree minus the paths l
 `.mergeignore`. The development history is never merged in, so the release branch carries neither
 the development commits nor any historical version of the excluded files. The release branch and
 its tags can then go to one or more remotes, such as a private repository and a public one.
+With staging remotes configured, a release reaches them first, where it can still be amended,
+and the release remotes only on a separate `ease publish`.
 
 Nothing is checked out to build a snapshot: ease assembles it in a temporary index, leaving the
 working tree and the current branch untouched. Each project configures ease in a `.ease.toml`
@@ -49,7 +52,7 @@ DEFAULT_VERSION_PATHS = {
     "cargo": "Cargo.toml",
     "file": "VERSION",
 }
-HOOKS = ("pre-release", "post-release", "post-push")
+HOOKS = ("pre-release", "post-release", "post-push", "pre-publish", "post-publish")
 
 # A link reference definition ('[0.1.0]: https://…'). Keep a Changelog collects them at the foot
 # of the file, so they end the newest section, which has no '## ' heading after it.
@@ -112,6 +115,7 @@ class Config:
     release_branch: str = "main"
     dev_remote: str = "origin"
     release_remotes: tuple[str, ...] = ("origin",)
+    staging_remotes: tuple[str, ...] = ()
     mergeignore: str = ".mergeignore"
     changelog: str = "CHANGELOG.md"
     tag: str = "v{version}"
@@ -124,6 +128,11 @@ class Config:
     version_command: str = ""
     hooks: Mapping[str, str] = field(default_factory=dict[str, str])
 
+    @property
+    def push_remotes(self) -> tuple[str, ...]:
+        """The remotes `ease push` sends the release to: the staging ones, when there are any."""
+        return self.staging_remotes or self.release_remotes
+
 
 # TOML key: Config attribute. Each value is a string unless listed in LIST_KEYS.
 TOP_LEVEL_KEYS = {
@@ -131,6 +140,7 @@ TOP_LEVEL_KEYS = {
     "release-branch": "release_branch",
     "dev-remote": "dev_remote",
     "release-remotes": "release_remotes",
+    "staging-remotes": "staging_remotes",
     "mergeignore": "mergeignore",
     "changelog": "changelog",
     "tag": "tag",
@@ -139,7 +149,7 @@ TOP_LEVEL_KEYS = {
     "required": "required",
     "artifacts": "artifacts",
 }
-LIST_KEYS = ("release-remotes", "required")
+LIST_KEYS = ("release-remotes", "staging-remotes", "required")
 VERSION_KEYS = {"source": "version_source", "path": "version_path", "command": "version_command"}
 
 
@@ -204,6 +214,13 @@ def config_from_toml(text: str) -> Config:
         raise EaseError(f"{CONFIG_FILE}: the branch names must not be empty")
     if config.dev_branch == config.release_branch:
         raise EaseError(f"{CONFIG_FILE}: dev-branch and release-branch must differ")
+    both = sorted(set(config.staging_remotes) & set(config.release_remotes))
+    if both:
+        raise EaseError(
+            f"{CONFIG_FILE}: {', '.join(both)} cannot be both a staging and a release remote"
+        )
+    if config.staging_remotes and not config.release_remotes:
+        raise EaseError(f"{CONFIG_FILE}: staging-remotes needs release-remotes to publish to")
     if config.artifacts:
         parts = Path(config.artifacts).parts
         if Path(config.artifacts).is_absolute() or ".." in parts or not parts:
@@ -220,6 +237,7 @@ def config_template(
     dev_remote: str,
     release_remotes: Sequence[str],
     version_source: str,
+    staging_remotes: Sequence[str] = (),
     required: Sequence[str],
     changelog: str = "CHANGELOG.md",
     tag: str = "v{version}",
@@ -239,8 +257,11 @@ dev-branch = {q(dev_branch)}
 release-branch = {q(release_branch)}
 # Where the development branch is pushed; "" for nowhere.
 dev-remote = {q(dev_remote)}
-# Where the release branch and its tags are pushed.
+# Where the release branch and its tags are published.
 release-remotes = {q_list(release_remotes)}
+# Where `ease push` stages a release first, if anywhere; `ease publish` then sends it on to
+# release-remotes. A staged release can still be amended; a published one cannot.
+{"" if staging_remotes else "# "}staging-remotes = {q_list(staging_remotes)}
 mergeignore = ".mergeignore"
 # Supplies the release notes; "" to pass them with -m or -F instead.
 changelog = {q(changelog)}
@@ -263,10 +284,12 @@ source = {q(version_source)}
 
 [hooks]
 # Shell commands run from the repository root, with EASE_VERSION, EASE_TAG, EASE_COMMIT and
-# friends in the environment. A failing pre-release hook aborts the release.
+# friends in the environment. A failing pre-release or pre-publish hook aborts.
 # pre-release = "make check"
 # post-release = "echo 'Pushing the tag triggers the package upload.'"
 # post-push = ""
+# pre-publish = "gh run watch --exit-status ..."   # with staging-remotes: vet the staged release
+# post-publish = ""
 """
 
 
@@ -601,6 +624,7 @@ def hook_env(config: Config, **values: str | None) -> dict[str, str]:
         "EASE_DEV_BRANCH": config.dev_branch,
         "EASE_RELEASE_BRANCH": config.release_branch,
         "EASE_REMOTES": " ".join(config.release_remotes),
+        "EASE_STAGING_REMOTES": " ".join(config.staging_remotes),
     }
     for key, value in values.items():
         env[f"EASE_{key.upper()}"] = value or ""
@@ -893,8 +917,15 @@ def cmd_init(args: argparse.Namespace, git: Git) -> int:
         else:
             new_remotes[name] = url
     remotes = sorted({*existing, *new_remotes}, key=lambda r: (r != "origin", r))
+    staging = list(dict.fromkeys(cast(list[str], args.staging_remote)))
+    for name in staging:
+        if name not in remotes:
+            raise EaseError(f"staging remote '{name}' is not a remote: add it with --remote")
     # An existing setup shows where its release branch goes; without that evidence, use all.
     tracking = [r for r in remotes if git.rev(remote_ref(r, release))] if args.existing else []
+    release_remotes = [r for r in tracking or remotes if r not in staging]
+    if staging and not release_remotes:
+        raise EaseError("every remote is a staging remote: add one to publish to with --remote")
 
     changelog = "CHANGELOG.md"
     version_source = args.version_source or detect_version_source(git.root)
@@ -914,7 +945,8 @@ def cmd_init(args: argparse.Namespace, git: Git) -> int:
             dev_branch=dev,
             release_branch=release,
             dev_remote="origin" if "origin" in remotes else "",
-            release_remotes=tracking or remotes,
+            release_remotes=release_remotes,
+            staging_remotes=staging,
             version_source=version_source,
             required=required,
             changelog=changelog,
@@ -957,21 +989,30 @@ def cmd_init(args: argparse.Namespace, git: Git) -> int:
 
 
 def check_lag(
-    git: Git, branch: str, tip: str, remotes: Sequence[str], force: bool, stale: str
+    git: Git,
+    branch: str,
+    tip: str,
+    remotes: Sequence[str],
+    force: bool,
+    stale: str,
+    replaceable: Callable[[str], bool] | None = None,
 ) -> None:
     """Refuse to release while a local branch trails one of its remotes.
 
     Both the release branch and the source branch are checked: a stale release branch would
     orphan every release pushed since, and a stale source branch would ship a snapshot missing
     commits already published to its remote. ``stale`` says which, in the refusal. Being ahead
-    is fine: it is unpushed work. The check reads remote-tracking refs, so it is as fresh as
-    the last fetch.
+    is fine: it is unpushed work. So is having diverged from a remote whose tip ``replaceable``
+    accepts: a staged release that was amended locally, and is still to be restaged. The check
+    reads remote-tracking refs, so it is as fresh as the last fetch.
     """
     for remote in remotes:
         remote_sha = git.rev(remote_ref(remote, branch))
         if remote_sha is None:
             continue
         kind = relation(git, tip, remote_sha)
+        if kind == "diverged" and replaceable is not None and replaceable(remote_sha):
+            continue
         if kind == "behind":
             message = (
                 f"'{branch}' is behind '{remote}/{branch}': {stale}. "
@@ -990,7 +1031,10 @@ def check_lag(
 
 
 def published_on(git: Git, config: Config, commit: str) -> str | None:
-    """Return the first release remote whose release branch contains a commit."""
+    """Return the first release remote whose release branch contains a commit.
+
+    Staging remotes do not count: a staged release can still be amended.
+    """
     for remote in config.release_remotes:
         remote_sha = git.rev(remote_ref(remote, config.release_branch))
         if remote_sha is not None and git.is_ancestor(commit, remote_sha):
@@ -1067,14 +1111,14 @@ def edit_message(git: Git, path: Path, summary: str) -> None:
 def push_commands(
     config: Config, tag: str | None, force_branch: bool, force_tag: bool
 ) -> list[list[str]]:
-    """List the pushes that publish the release branch, then its tag, to every remote."""
+    """List the pushes that send the release branch, then its tag, to every push remote."""
     branch = [
         ["push", *(["--force-with-lease"] if force_branch else []), r, config.release_branch]
-        for r in config.release_remotes
+        for r in config.push_remotes
     ]
     tags = [
         ["push", *(["--force"] if force_tag else []), r, f"refs/tags/{tag}"]
-        for r in config.release_remotes
+        for r in config.push_remotes
         if tag
     ]
     return branch + tags
@@ -1098,16 +1142,19 @@ def cmd_release(args: argparse.Namespace, git: Git, config: Config) -> int:
     # The ref moves without a checkout, which would desync any worktree that has it checked out.
     if branch in git.checked_out():
         raise EaseError(f"'{branch}' is checked out: switch to {config.dev_branch} and re-run")
-    missing = [r for r in config.release_remotes if r not in git.remotes()]
+    if args.publish and not config.staging_remotes:
+        raise EaseError("--publish needs staging-remotes: without them, --push publishes")
+    remotes = [*config.staging_remotes, *config.release_remotes]
+    missing = [r for r in remotes if r not in git.remotes()]
     for remote in missing:
-        warn(f"release remote '{remote}' is not defined: git remote add {remote} <url>")
-    if args.push and missing:
-        raise EaseError("cannot --push to undefined remotes")
+        warn(f"remote '{remote}' is not defined: git remote add {remote} <url>")
+    if (args.push or args.publish) and missing:
+        raise EaseError("cannot push to undefined remotes")
 
     dev_remotes = [config.dev_remote] if config.dev_remote else []
-    if not args.offline and (config.release_remotes or dev_remotes):
+    if not args.offline and (remotes or dev_remotes):
         info("fetching the remotes")
-        fetch(git, [*config.release_remotes, *dev_remotes])
+        fetch(git, [*remotes, *dev_remotes])
     check_lag(
         git,
         branch,
@@ -1115,6 +1162,16 @@ def cmd_release(args: argparse.Namespace, git: Git, config: Config) -> int:
         config.release_remotes,
         args.force,
         "the release would be built on an outdated history",
+    )
+    # A staged release replaced by a local amend is diverged on purpose: `ease push` restages it.
+    check_lag(
+        git,
+        branch,
+        tip,
+        config.staging_remotes,
+        args.force,
+        "the release would be built on an outdated history",
+        lambda staged: replaced_release(git, config, staged, tip),
     )
     # A source given as a tag or SHA has no remote-tracking counterpart, so it is skipped.
     check_lag(
@@ -1329,17 +1386,33 @@ def cmd_release(args: argparse.Namespace, git: Git, config: Config) -> int:
             warn("the post-release hook failed")
 
     print()
-    if not config.release_remotes:
+    if not config.push_remotes:
         if args.push:
             warn("release-remotes is empty: there is nowhere to push")
         return 0
-    if args.push:
-        return push(git, config, dry_run=False, push_dev=True, skip_hooks=args.skip_hooks)
-    info("To publish, push the branch first, then the tag (or run `ease push`):")
-    for command in push_commands(config, tag, bool(pushed_to), tag_exists):
+    if args.push or args.publish:
+        code = push(git, config, dry_run=False, push_dev=True, skip_hooks=args.skip_hooks)
+        if code or not args.publish:
+            return code
+        print()
+        return publish(
+            git, config, dry_run=False, yes=args.yes, force=False, skip_hooks=args.skip_hooks
+        )
+    staging = bool(config.staging_remotes)
+    action = "stage" if staging else "publish"
+    info(f"To {action}, push the branch first, then the tag (or run `ease push`):")
+    # After an amend, the replaced release may already be on a push remote: overwrite it there.
+    rewrite = args.amend and any(
+        (remote_sha := git.rev(remote_ref(remote, branch))) is not None
+        and git.is_ancestor(tip, remote_sha)
+        for remote in config.push_remotes
+    )
+    for command in push_commands(config, tag, rewrite, tag_exists):
         info(f"  git {' '.join(command)}")
+    if staging:
+        info("then publish with `ease publish`")
     for stale in stale_tags:
-        for remote in config.release_remotes:
+        for remote in (*config.staging_remotes, *config.release_remotes):
             info(f"  git push {remote} :refs/tags/{stale}   # only if {stale} was ever pushed")
     return 0
 
@@ -1347,23 +1420,20 @@ def cmd_release(args: argparse.Namespace, git: Git, config: Config) -> int:
 # ── push ─────────────────────────────────────────────────────────────────────
 
 
-def push(git: Git, config: Config, *, dry_run: bool, push_dev: bool, skip_hooks: bool) -> int:
-    """Push the release branch, then the tags at its tip, then the development branch."""
-    branch = config.release_branch
-    remotes = git.remotes()
-    missing = [r for r in config.release_remotes if r not in remotes]
-    if missing:
-        raise EaseError(f"undefined release remote(s): {', '.join(missing)}")
-    tip = git.rev(f"refs/heads/{branch}")
-    if tip is None:
-        raise EaseError(f"release branch '{branch}' does not exist")
-    dev_remote = config.dev_remote if push_dev and config.dev_remote in remotes else ""
-    fetch(git, [*config.release_remotes, *([dev_remote] if dev_remote else [])])
+def plan_release_pushes(
+    git: Git, config: Config, remotes: Sequence[str], tip: str, *, rewrite: bool
+) -> tuple[list[list[str]], list[list[str]]]:
+    """Plan the pushes that bring the release branch, then its tip's tags, to some remotes.
 
+    A remote whose branch has diverged is overwritten only when ``rewrite`` allows it and the
+    local tip replaced the remote's release commit, as `release --amend` does; a tag that
+    differs on the remote, only along with such a branch.
+    """
+    branch = config.release_branch
     tags = tags_at(git, config, tip)
     branch_pushes: list[list[str]] = []
     tag_pushes: list[list[str]] = []
-    for remote in config.release_remotes:
+    for remote in remotes:
         remote_sha = git.rev(remote_ref(remote, branch))
         kind = "ahead" if remote_sha is None else relation(git, tip, remote_sha)
         rewritten = False
@@ -1373,7 +1443,7 @@ def push(git: Git, config: Config, *, dry_run: bool, push_dev: bool, skip_hooks:
             raise EaseError(f"'{branch}' is behind '{remote}/{branch}': run `ease status --fix`")
         elif kind == "diverged":
             assert remote_sha is not None
-            if not replaced_release(git, config, remote_sha, tip):
+            if not (rewrite and replaced_release(git, config, remote_sha, tip)):
                 raise EaseError(
                     f"'{branch}' has diverged from '{remote}/{branch}': reconcile by hand"
                 )
@@ -1391,6 +1461,42 @@ def push(git: Git, config: Config, *, dry_run: bool, push_dev: bool, skip_hooks:
                 raise EaseError(f"tag {tag} on '{remote}' differs from the local one")
             force = ["--force"] if remote_tag is not None else []
             tag_pushes.append(["push", *force, remote, f"refs/tags/{tag}"])
+    return branch_pushes, tag_pushes
+
+
+def check_remotes(git: Git, remotes: Sequence[str]) -> None:
+    """Refuse to push to remotes that are not defined."""
+    missing = [r for r in remotes if r not in git.remotes()]
+    if missing:
+        raise EaseError(f"undefined remote(s): {', '.join(missing)}")
+
+
+def run_pushes(git: Git, commands: Sequence[Sequence[str]], *, dry_run: bool) -> None:
+    """Run (or, on a dry run, only print) a list of git pushes."""
+    for command in commands:
+        info(f"{'would run' if dry_run else 'running'}: git {' '.join(command)}")
+        if not dry_run:
+            git.run(*command)
+
+
+def push(git: Git, config: Config, *, dry_run: bool, push_dev: bool, skip_hooks: bool) -> int:
+    """Push the release branch, then the tags at its tip, then the development branch.
+
+    The release goes to the staging remotes when there are any, else to the release remotes.
+    Either way it may replace a release that `release --amend` rewrote.
+    """
+    branch = config.release_branch
+    check_remotes(git, config.push_remotes)
+    tip = git.rev(f"refs/heads/{branch}")
+    if tip is None:
+        raise EaseError(f"release branch '{branch}' does not exist")
+    remotes = git.remotes()
+    dev_remote = config.dev_remote if push_dev and config.dev_remote in remotes else ""
+    fetch(git, [*config.push_remotes, *([dev_remote] if dev_remote else [])])
+
+    branch_pushes, tag_pushes = plan_release_pushes(
+        git, config, config.push_remotes, tip, rewrite=True
+    )
 
     dev_pushes: list[list[str]] = []
     if dev_remote:
@@ -1408,22 +1514,104 @@ def push(git: Git, config: Config, *, dry_run: bool, push_dev: bool, skip_hooks:
     if not commands:
         info("everything is already pushed")
         return 0
-    for command in commands:
-        info(f"{'would run' if dry_run else 'running'}: git {' '.join(command)}")
-        if not dry_run:
-            git.run(*command)
+    run_pushes(git, commands, dry_run=dry_run)
     if dry_run:
         return 0
+    tags = tags_at(git, config, tip)
     env = hook_env(config, tag=tags[0] if tags else None, commit=tip)
     if not skip_hooks and not run_hook("post-push", config, git.root, env):
         warn("the post-push hook failed")
+    if config.staging_remotes and branch_pushes:
+        info("staged, not published: run `ease publish` once the staged release checks out")
     return 0
 
 
 def cmd_push(args: argparse.Namespace, git: Git, config: Config) -> int:
-    """Push the release to every release remote."""
+    """Push the release to every staging remote, or, without any, to every release remote."""
     return push(
         git, config, dry_run=args.dry_run, push_dev=not args.no_dev, skip_hooks=args.skip_hooks
+    )
+
+
+# ── publish ──────────────────────────────────────────────────────────────────
+
+
+def publish(
+    git: Git, config: Config, *, dry_run: bool, yes: bool, force: bool, skip_hooks: bool
+) -> int:
+    """Push a staged release on to the release remotes, once the pre-publish hook approves it.
+
+    Publication is the step that cannot be undone, so it never overwrites a release remote
+    unless forced, and refuses a release that has not reached every staging remote: whatever
+    vets the staged release, such as CI, would not have seen it.
+    """
+    branch = config.release_branch
+    if not config.staging_remotes:
+        raise EaseError("publish needs staging-remotes: without them, `ease push` publishes")
+    check_remotes(git, [*config.staging_remotes, *config.release_remotes])
+    tip = git.rev(f"refs/heads/{branch}")
+    if tip is None:
+        raise EaseError(f"release branch '{branch}' does not exist")
+    if not is_release_commit(git, config, tip):
+        raise EaseError(f"the tip of {branch} is not a release: run `ease release` first")
+    fetch(git, [*config.staging_remotes, *config.release_remotes])
+
+    tags = tags_at(git, config, tip)
+    for remote in config.staging_remotes:
+        remote_sha = git.rev(remote_ref(remote, branch))
+        on_remote = git.remote_tags(remote) if tags else {}
+        staged = remote_sha is not None and git.is_ancestor(tip, remote_sha)
+        staged = staged and all(on_remote.get(t) == git.rev(f"refs/tags/{t}") for t in tags)
+        if not staged:
+            message = f"the release at the tip of {branch} is not staged on '{remote}'"
+            if not force:
+                raise EaseError(f"{message}: run `ease push` first, or use --force")
+            warn(f"{message}: proceeding (--force)")
+
+    branch_pushes, tag_pushes = plan_release_pushes(
+        git, config, config.release_remotes, tip, rewrite=force
+    )
+    commands = branch_pushes + tag_pushes
+    if not commands:
+        info("everything is already published")
+        return 0
+
+    env = hook_env(
+        config, tag=tags[0] if tags else None, commit=tip, dry_run="1" if dry_run else "0"
+    )
+    if skip_hooks:
+        if "pre-publish" in config.hooks:
+            warn("skipping the pre-publish hook (--skip-hooks)")
+    elif not run_hook("pre-publish", config, git.root, env):
+        raise EaseError("the pre-publish hook failed: nothing published")
+
+    release = tags[0] if tags else git.short(tip)
+    print()
+    info(f"=== publishing {release} to {', '.join(config.release_remotes)} ===")
+    for command in commands:
+        print(f"  git {' '.join(command)}")
+    print()
+    if dry_run:
+        info("dry run: nothing published")
+        return 0
+    if not yes and not confirm(f"Publish {release}? This cannot be undone."):
+        info("not published: run `ease publish` when ready")
+        return 0
+    run_pushes(git, commands, dry_run=False)
+    if not skip_hooks and not run_hook("post-publish", config, git.root, env):
+        warn("the post-publish hook failed")
+    return 0
+
+
+def cmd_publish(args: argparse.Namespace, git: Git, config: Config) -> int:
+    """Push the staged release on to every release remote."""
+    return publish(
+        git,
+        config,
+        dry_run=args.dry_run,
+        yes=args.yes,
+        force=args.force,
+        skip_hooks=args.skip_hooks,
     )
 
 
@@ -1512,9 +1700,21 @@ def _write_file(path: Path, content: str) -> Callable[[], object]:
 
 
 def _branch_checks(
-    git: Git, report: Report, branch: str, remotes: Sequence[str], role: str
+    git: Git,
+    report: Report,
+    branch: str,
+    remotes: Sequence[str],
+    role: str,
+    *,
+    publish_only: bool = False,
+    amendable: Callable[[str], bool] | None = None,
 ) -> None:
-    """Compare a local branch with its remote-tracking counterparts."""
+    """Compare a local branch with its remote-tracking counterparts.
+
+    With ``publish_only``, only `ease publish` may push to these remotes, so a branch that is
+    missing or behind there gets no push fix. ``amendable`` accepts a diverged remote tip that
+    the local branch replaced on purpose, which `ease push` then overwrites.
+    """
     local = git.rev(f"refs/heads/{branch}")
     if local is None:
         return
@@ -1527,11 +1727,18 @@ def _branch_checks(
             git.run("push", "--quiet", remote, refspec)
 
         if remote_sha is None:
-            report.warn(f"{role} '{branch}' is not on '{remote}'", push_it, f"push it to {remote}")
+            if publish_only:
+                report.warn(f"{role} '{branch}' is not on '{remote}': run `ease publish`")
+            else:
+                report.warn(
+                    f"{role} '{branch}' is not on '{remote}'", push_it, f"push it to {remote}"
+                )
             continue
         kind = relation(git, local, remote_sha)
         if kind == "equal":
             report.ok(f"{role} '{branch}' matches {name}")
+        elif kind == "ahead" and publish_only:
+            report.warn(f"{role} '{branch}' is ahead of {name}: staged, not published")
         elif kind == "ahead":
             count = git.run("rev-list", "--count", f"{remote_sha}..{local}")
             report.warn(
@@ -1539,6 +1746,8 @@ def _branch_checks(
                 push_it,
                 f"push to {remote}",
             )
+        elif kind == "diverged" and amendable is not None and amendable(remote_sha):
+            report.warn(f"{role} '{branch}' replaces the release staged on {name}: `ease push`")
         elif kind == "behind":
 
             def catch_up(target: str = remote_sha) -> None:
@@ -1585,7 +1794,11 @@ def collect_checks(git: Git, config: Config, config_error: str | None, offline: 
 
     # ── Remotes ──
     remotes = git.remotes()
-    wanted = list(dict.fromkeys([*config.release_remotes, *filter(None, [config.dev_remote])]))
+    wanted = list(
+        dict.fromkeys(
+            [*config.staging_remotes, *config.release_remotes, *filter(None, [config.dev_remote])]
+        )
+    )
     for remote in wanted:
         if remote not in remotes:
             report.error(f"remote '{remote}' is not defined: git remote add {remote} <url>")
@@ -1598,11 +1811,16 @@ def collect_checks(git: Git, config: Config, config_error: str | None, offline: 
             report.warn(f"fetch failed, so remote state may be stale: {exc}")
             online = False
     release_remotes = [r for r in config.release_remotes if r in remotes]
+    staging_remotes = [r for r in config.staging_remotes if r in remotes]
     dev_remotes = [config.dev_remote] if config.dev_remote in remotes else []
+    staged = bool(config.staging_remotes)
 
     # ── Branches ──
     if release_sha is None:
-        tracking = next((r for r in release_remotes if git.rev(remote_ref(r, branch))), None)
+        tracking = next(
+            (r for r in [*staging_remotes, *release_remotes] if git.rev(remote_ref(r, branch))),
+            None,
+        )
         if tracking:
             report.error(
                 f"release branch '{branch}' does not exist",
@@ -1652,7 +1870,17 @@ def collect_checks(git: Git, config: Config, config_error: str | None, offline: 
     if git.commit("HEAD") and not git.is_clean():
         report.warn("the working tree has uncommitted changes, which a release refuses")
 
-    _branch_checks(git, report, branch, release_remotes, "release branch")
+    _branch_checks(
+        git,
+        report,
+        branch,
+        staging_remotes,
+        "release branch",
+        amendable=lambda old: (
+            release_sha is not None and replaced_release(git, config, old, release_sha)
+        ),
+    )
+    _branch_checks(git, report, branch, release_remotes, "release branch", publish_only=staged)
     _branch_checks(git, report, dev, dev_remotes, "development branch")
 
     # ── Release tip and tags ──
@@ -1669,7 +1897,8 @@ def collect_checks(git: Git, config: Config, config_error: str | None, offline: 
             report.warn(f"'{branch}' tip {short} looks like a release, but has no tag")
         if online and config.tag:
             local_tags = release_tags(git, config, "--merged", release_sha)
-            for remote in release_remotes:
+            for remote in [*staging_remotes, *release_remotes]:
+                publish_only = staged and remote in release_remotes
                 on_remote = git.remote_tags(remote)
                 absent = [t for t in local_tags if t not in on_remote]
                 differ = [
@@ -1677,7 +1906,11 @@ def collect_checks(git: Git, config: Config, config_error: str | None, offline: 
                     for t in local_tags
                     if t in on_remote and on_remote[t] != git.rev(f"refs/tags/{t}")
                 ]
-                if absent:
+                if absent and publish_only:
+                    report.warn(
+                        f"tag(s) missing on '{remote}': {', '.join(absent)}: run `ease publish`"
+                    )
+                elif absent:
 
                     def push_tags(remote: str = remote, absent: list[str] = absent) -> None:
                         git.run("push", "--quiet", remote, *(f"refs/tags/{t}" for t in absent))
@@ -1687,9 +1920,17 @@ def collect_checks(git: Git, config: Config, config_error: str | None, offline: 
                         push_tags,
                         f"push them to {remote}",
                     )
+                # An amended release, not yet restaged, moved its tag: `ease push` moves it there.
+                restage = [t for t in differ if remote in staging_remotes and t in tip_tags]
+                if restage:
+                    report.warn(
+                        f"tag(s) moved by an amend, not yet on '{remote}': "
+                        f"{', '.join(restage)}: run `ease push`"
+                    )
+                differ = [t for t in differ if t not in restage]
                 if differ:
                     report.error(f"tag(s) differ on '{remote}': {', '.join(differ)}")
-                if local_tags and not absent and not differ:
+                if local_tags and not absent and not differ and not restage:
                     report.ok(f"every release tag is on '{remote}'")
 
     # ── Version, changelog, and pending changes ──
@@ -1800,6 +2041,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME=URL",
         help="add a release remote (repeatable)",
     )
+    init.add_argument(
+        "--staging-remote",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="stage releases on this remote before publishing them (repeatable)",
+    )
     init.add_argument("--dev-branch", default="dev", help="development branch name (default: dev)")
     init.add_argument(
         "--release-branch",
@@ -1855,6 +2103,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--amend", action="store_true", help="replace the unpushed release at the tip"
     )
     release.add_argument("--push", action="store_true", help="push the release afterwards")
+    release.add_argument(
+        "--publish",
+        action="store_true",
+        help="with staging-remotes: push the release, then publish it",
+    )
     release.add_argument("--offline", action="store_true", help="do not fetch the remotes first")
     release.add_argument("-n", "--dry-run", action="store_true", help="report, write nothing")
     release.add_argument(
@@ -1873,6 +2126,25 @@ def build_parser() -> argparse.ArgumentParser:
     push_parser.add_argument("--no-dev", action="store_true", help="do not push the dev branch")
     push_parser.add_argument("--skip-hooks", action="store_true", help="run no hooks")
     push_parser.add_argument("-n", "--dry-run", action="store_true", help="print the pushes only")
+
+    publish_parser = commands.add_parser(
+        "publish",
+        help="push the staged release to the release remotes",
+        description=cmd_publish.__doc__,
+    )
+    publish_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="publish a release that is not staged, or overwrite an amended published one",
+    )
+    publish_parser.add_argument("--skip-hooks", action="store_true", help="run no hooks")
+    publish_parser.add_argument(
+        "-n", "--dry-run", action="store_true", help="run the pre-publish hook, push nothing"
+    )
+    publish_parser.add_argument(
+        "-y", "--yes", action="store_true", help="do not ask for confirmation"
+    )
     return parser
 
 
@@ -1890,7 +2162,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config, config_error = Config(), str(exc)
             return cmd_status(args, git, config, config_error)
         config = load_config(git)
-        handlers = {"release": cmd_release, "push": cmd_push, "changelog": cmd_changelog}
+        handlers = {
+            "release": cmd_release,
+            "push": cmd_push,
+            "publish": cmd_publish,
+            "changelog": cmd_changelog,
+        }
         return handlers[args.command](args, git, config)
     except EaseError as exc:
         print(f"error: {exc}", file=sys.stderr)
